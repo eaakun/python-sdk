@@ -3957,11 +3957,10 @@ async def test_refresh_flow_retries_with_server_provided_nonce(
     Provenance: RFC 9449 §9.1 applied to the refresh_token grant.
     """
 
-    async def callback_handler() -> AuthorizationCodeResult:
-        raise AssertionError("full re-auth must not trigger here")
+    # Must never run: if the flow falls back to full re-auth, the mock raises.
+    callback_handler = mock.AsyncMock(side_effect=AssertionError("full re-auth must not trigger here"))
 
-    async def redirect_handler(url: str) -> None:
-        pass
+    redirect_handler = mock.AsyncMock()
 
     provider = _dpop_e2e_provider(client_metadata, mock_storage, redirect_handler, callback_handler)
     provider._initialized = True
@@ -4009,11 +4008,10 @@ async def test_refresh_flow_succeeds_without_nonce_challenge(
     Provenance: SDK-defined; the retry path must stay dormant without a challenge.
     """
 
-    async def callback_handler() -> AuthorizationCodeResult:
-        raise AssertionError("full re-auth must not trigger here")
+    # Must never run: if the flow falls back to full re-auth, the mock raises.
+    callback_handler = mock.AsyncMock(side_effect=AssertionError("full re-auth must not trigger here"))
 
-    async def redirect_handler(url: str) -> None:
-        pass
+    redirect_handler = mock.AsyncMock()
 
     provider = _dpop_e2e_provider(client_metadata, mock_storage, redirect_handler, callback_handler)
     provider._initialized = True
