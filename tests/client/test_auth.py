@@ -3,13 +3,15 @@
 import base64
 import json
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
+from typing import Any
 from unittest import mock
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import httpx2
 import jwt
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePublicKey
 from inline_snapshot import Is, snapshot
 from jwt.algorithms import ECAlgorithm
 from pydantic import AnyHttpUrl, AnyUrl
@@ -3677,17 +3679,17 @@ async def test_issuer_is_stamped_when_same_origin_fallback_register_is_on_the_di
 def _dpop_prm() -> ProtectedResourceMetadata:
     """PRM advertising ES256 DPoP support (the SDK surfaces the flag here)."""
     return ProtectedResourceMetadata(
-        resource="https://api.example.com/v1/mcp",
-        authorization_servers=["https://auth.example.com"],
+        resource=AnyHttpUrl("https://api.example.com/v1/mcp"),
+        authorization_servers=[AnyHttpUrl("https://auth.example.com")],
         dpop_signing_alg_values_supported=["ES256"],
     )
 
 
 def _dpop_oauth_metadata() -> OAuthMetadata:
     return OAuthMetadata(
-        issuer="https://auth.example.com",
-        authorization_endpoint="https://auth.example.com/authorize",
-        token_endpoint="https://auth.example.com/token",
+        issuer=AnyHttpUrl("https://auth.example.com"),
+        authorization_endpoint=AnyHttpUrl("https://auth.example.com/authorize"),
+        token_endpoint=AnyHttpUrl("https://auth.example.com/token"),
     )
 
 
@@ -3700,11 +3702,12 @@ def _dpop_client_info() -> OAuthClientInformationFull:
     )
 
 
-def _verified_dpop_claims(request: httpx2.Request) -> dict:
+def _verified_dpop_claims(request: httpx2.Request) -> dict[str, Any]:
     """Decode the DPoP proof on a request, verifying its signature."""
     proof = request.headers["DPoP"]
     jwk = jwt.get_unverified_header(proof)["jwk"]
     key = ECAlgorithm.from_jwk(json.dumps(jwk))
+    assert isinstance(key, EllipticCurvePublicKey)
     return jwt.decode(proof, key, algorithms=["ES256"])
 
 
@@ -3845,8 +3848,8 @@ async def test_dpop_nonce_retry_ignores_non_challenge_responses(
 def _dpop_e2e_provider(
     client_metadata: OAuthClientMetadata,
     mock_storage: MockTokenStorage,
-    redirect_handler,
-    callback_handler,
+    redirect_handler: Callable[[str], Awaitable[None]],
+    callback_handler: Callable[[], Awaitable[AuthorizationCodeResult]],
 ) -> OAuthClientProvider:
     return OAuthClientProvider(
         server_url="https://api.example.com/v1/mcp",
@@ -3867,8 +3870,10 @@ async def test_token_flow_retries_with_server_provided_nonce(
     mock AS that advertises DPoP in its protected resource metadata.
     """
     captured: dict[str, str] = {}
+    grant_runs: list[str] = []
 
     async def redirect_handler(url: str) -> None:
+        grant_runs.append(url)
         captured["state"] = parse_qs(urlparse(url).query)["state"][0]
 
     async def callback_handler() -> AuthorizationCodeResult:
@@ -3922,6 +3927,9 @@ async def test_token_flow_retries_with_server_provided_nonce(
         jwt.get_unverified_header(retry_request.headers["DPoP"])["jwk"]
         == jwt.get_unverified_header(token_request.headers["DPoP"])["jwk"]
     )
+    # The retry rebuilds only the token exchange: the authorization grant
+    # (user interaction) must not run a second time.
+    assert len(grant_runs) == 1
 
     final_request = await auth_flow.asend(
         httpx2.Response(

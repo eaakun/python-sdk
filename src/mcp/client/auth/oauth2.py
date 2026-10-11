@@ -179,6 +179,9 @@ class OAuthContext:
     # DPoP (RFC 9449): in-memory key. A restart drops it; the next refresh
     # then fails once and the flow re-authorizes with a fresh key.
     dpop_private_jwk: str | None = None
+    # DPoP (RFC 9449): server-provided nonce from the last DPoP-Nonce
+    # challenge. Sent with subsequent proofs until the server rotates it.
+    dpop_nonce: str | None = None
 
     # State
     lock: anyio.Lock = field(default_factory=anyio.Lock)
@@ -353,6 +356,11 @@ class OAuthClientProvider(RedirectAwareAuth):
         )
         self._validate_resource_url_callback = validate_resource_url
         self._initialized = False
+        # Rebuilds the token request when a DPoP nonce challenge arrives.
+        # Defaults to the full authorization; the authorization-code flow
+        # rebinds it to the token exchange only (re-running the grant would
+        # repeat user interaction).
+        self._dpop_exchange_rebuilder: Callable[[], Awaitable[httpx2.Request]] = self._perform_authorization
 
     async def _handle_protected_resource_response(self, response: httpx2.Response) -> bool:
         """Handle protected resource metadata discovery response.
@@ -385,11 +393,17 @@ class OAuthClientProvider(RedirectAwareAuth):
                 f"Protected Resource Metadata request failed: {response.status_code}"
             )  # pragma: no cover
 
-    async def _perform_authorization(self, dpop_nonce: str | None = None) -> httpx2.Request:
+    async def _perform_authorization(self) -> httpx2.Request:
         """Perform the authorization flow."""
         auth_code, code_verifier = await self._perform_authorization_code_grant()
-        token_request = await self._exchange_token_authorization_code(auth_code, code_verifier, dpop_nonce)
-        return token_request
+
+        # A DPoP nonce challenge must rebuild only the token exchange, not
+        # the whole grant (which would repeat user interaction).
+        async def rebuild_exchange() -> httpx2.Request:
+            return await self._exchange_token_authorization_code(auth_code, code_verifier)
+
+        self._dpop_exchange_rebuilder = rebuild_exchange
+        return await rebuild_exchange()
 
     async def _perform_authorization_code_grant(self) -> tuple[str, str]:
         """Perform the authorization redirect and get auth code."""
@@ -463,22 +477,25 @@ class OAuthClientProvider(RedirectAwareAuth):
         """Whether DPoP proofs apply to token requests right now."""
         return is_dpop_supported(self.context.protected_resource_metadata)
 
-    def _dpop_headers(self, token_url: str, dpop_nonce: str | None = None) -> dict[str, str]:
+    def _dpop_headers(self, token_url: str) -> dict[str, str]:
         """DPoP header for a token request, or empty when DPoP is inactive."""
         if not self._dpop_active():
             return {}
         if self.context.dpop_private_jwk is None:
             self.context.dpop_private_jwk = generate_dpop_key()
-        proof = create_dpop_proof(self.context.dpop_private_jwk, htm="POST", htu=token_url, nonce=dpop_nonce)
+        proof = create_dpop_proof(
+            self.context.dpop_private_jwk, htm="POST", htu=token_url, nonce=self.context.dpop_nonce
+        )
         return {"DPoP": proof}
 
     async def _dpop_nonce_retry(
-        self, response: httpx2.Response, build_request: Callable[..., Awaitable[httpx2.Request]]
+        self, response: httpx2.Response, build_request: Callable[[], Awaitable[httpx2.Request]]
     ) -> httpx2.Request | None:
         """Rebuild a token request when the AS answers with a DPoP nonce challenge.
 
         Returns the retry request, or None when no retry applies. Retries at most
-        once: the rebuilt request is not re-examined.
+        once: the rebuilt request is not re-examined. The nonce persists on the
+        context for subsequent proofs until the server rotates it (RFC 9449 §4.3).
         """
         if (
             response.status_code == 400
@@ -487,12 +504,11 @@ class OAuthClientProvider(RedirectAwareAuth):
             and "DPoP-Nonce" in response.headers
         ):
             logger.debug("Retrying token request with server-provided DPoP nonce")
-            return await build_request(dpop_nonce=response.headers["DPoP-Nonce"])
+            self.context.dpop_nonce = response.headers["DPoP-Nonce"]
+            return await build_request()
         return None
 
-    async def _exchange_token_authorization_code(
-        self, auth_code: str, code_verifier: str, dpop_nonce: str | None = None
-    ) -> httpx2.Request:
+    async def _exchange_token_authorization_code(self, auth_code: str, code_verifier: str) -> httpx2.Request:
         """Build token exchange request for authorization_code flow."""
         if self.context.client_metadata.redirect_uris is None:
             raise OAuthFlowError("No redirect URIs provided for authorization code grant")  # pragma: no cover
@@ -515,7 +531,7 @@ class OAuthClientProvider(RedirectAwareAuth):
         # Prepare authentication based on preferred method
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         token_data, headers = self.context.prepare_token_auth(token_data, headers)
-        headers.update(self._dpop_headers(token_url, dpop_nonce))
+        headers.update(self._dpop_headers(token_url))
 
         return httpx2.Request("POST", token_url, data=token_data, headers=headers)
 
@@ -543,7 +559,7 @@ class OAuthClientProvider(RedirectAwareAuth):
         self.context.update_token_expiry(token_response)
         await self.context.storage.set_tokens(token_response)
 
-    async def _refresh_token(self, dpop_nonce: str | None = None) -> httpx2.Request:
+    async def _refresh_token(self) -> httpx2.Request:
         """Build token refresh request."""
         if not self.context.current_tokens or not self.context.current_tokens.refresh_token:
             raise OAuthTokenError("No refresh token available")  # pragma: no cover
@@ -570,7 +586,7 @@ class OAuthClientProvider(RedirectAwareAuth):
         # Prepare authentication based on preferred method
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         refresh_data, headers = self.context.prepare_token_auth(refresh_data, headers)
-        headers.update(self._dpop_headers(token_url, dpop_nonce))
+        headers.update(self._dpop_headers(token_url))
 
         return httpx2.Request("POST", token_url, data=refresh_data, headers=headers)
 
@@ -831,7 +847,7 @@ class OAuthClientProvider(RedirectAwareAuth):
                     # Step 5: Perform authorization and complete token exchange
                     token_request = await self._perform_authorization()
                     token_response = yield token_request
-                    dpop_retry = await self._dpop_nonce_retry(token_response, self._perform_authorization)
+                    dpop_retry = await self._dpop_nonce_retry(token_response, self._dpop_exchange_rebuilder)
                     if dpop_retry is not None:
                         token_response = yield dpop_retry
                     await self._handle_token_response(token_response)

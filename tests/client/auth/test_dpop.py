@@ -1,10 +1,13 @@
 """Tests for mcp.client.auth.dpop (RFC 9449 DPoP proofs)."""
 
 import json
+from typing import Any
 
 import jwt
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePublicKey
 from jwt.algorithms import ECAlgorithm
+from pydantic import AnyHttpUrl
 
 from mcp.client.auth.dpop import (
     create_dpop_proof,
@@ -25,15 +28,16 @@ RFC9449_EXAMPLE_JWK = {
 RFC9449_EXAMPLE_JKT = "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I"
 
 
-def _decode_claims(proof: str) -> dict:
+def _decode_claims(proof: str) -> dict[str, Any]:
     """Claims without signature verification (structure assertions only)."""
     return jwt.decode(proof, options={"verify_signature": False})
 
 
-def _verify_signature(proof: str) -> dict:
+def _verify_signature(proof: str) -> dict[str, Any]:
     """Full verification against the proof's embedded JWK."""
     header = jwt.get_unverified_header(proof)
     key = ECAlgorithm.from_jwk(json.dumps(header["jwk"]))
+    assert isinstance(key, EllipticCurvePublicKey)
     return jwt.decode(proof, key, algorithms=["ES256"])
 
 
@@ -108,8 +112,8 @@ def test_dpop_support_requires_es256_in_server_metadata(algs: list[str] | None, 
     """DPoP activates only when the server advertises ES256 in its metadata."""
     metadata = (
         ProtectedResourceMetadata(
-            resource="https://api.example.com/v1/mcp",
-            authorization_servers=["https://auth.example.com"],
+            resource=AnyHttpUrl("https://api.example.com/v1/mcp"),
+            authorization_servers=[AnyHttpUrl("https://auth.example.com")],
             dpop_signing_alg_values_supported=algs,
         )
         if algs is not None
@@ -121,7 +125,7 @@ def test_dpop_support_requires_es256_in_server_metadata(algs: list[str] | None, 
 def test_dpop_support_ignores_metadata_without_dpop_field():
     """Servers that predate DPoP metadata simply don't get proofs."""
     metadata = ProtectedResourceMetadata(
-        resource="https://api.example.com/v1/mcp",
-        authorization_servers=["https://auth.example.com"],
+        resource=AnyHttpUrl("https://api.example.com/v1/mcp"),
+        authorization_servers=[AnyHttpUrl("https://auth.example.com")],
     )
     assert is_dpop_supported(metadata) is False
